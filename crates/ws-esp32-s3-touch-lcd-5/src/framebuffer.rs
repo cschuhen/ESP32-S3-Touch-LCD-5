@@ -1,0 +1,280 @@
+//! PSRAM-backed RGB565 framebuffer for the DPI panel — double-buffered.
+//!
+//! For 800×480 RGB565, one framebuffer is 768,000 bytes (two = 1,536,000 bytes)
+//! in 8 MiB Octal PSRAM. For `panel-1024x600`, one framebuffer is 1,228,800 bytes.
+
+use core::ops::Range;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Logical width of the visible framebuffer, in pixels.
+pub const WIDTH: usize = crate::consts::dpi::H_ACTIVE;
+/// Logical height of the visible framebuffer, in pixels.
+pub const HEIGHT: usize = crate::consts::dpi::V_ACTIVE;
+/// Bytes in one framebuffer (RGB565 = 2 bytes per pixel).
+pub const BYTES: usize = WIDTH * HEIGHT * 2;
+/// Total PSRAM bytes required (two buffers, back-to-back).
+pub const PSRAM_BYTES_REQUIRED: usize = BYTES * 2;
+
+/// CPU-side write handle to the PSRAM framebuffer pair.
+pub struct Framebuffer {
+    a: *mut u8,
+    b: *mut u8,
+    back_is_a: AtomicBool,
+}
+
+unsafe impl Send for Framebuffer {}
+unsafe impl Sync for Framebuffer {}
+
+impl Framebuffer {
+    /// Carve a pair of framebuffers off the start of the PSRAM region.
+    ///
+    /// # Safety
+    ///
+    /// `psram_ptr` must point to at least [`PSRAM_BYTES_REQUIRED`] bytes of valid,
+    /// CPU-mapped PSRAM, and the caller must guarantee nothing else accesses that
+    /// range for the lifetime of the returned values.
+    pub unsafe fn split_from_psram(
+        psram_ptr: *mut u8,
+        psram_size: usize,
+    ) -> Option<(*mut u8, Self)> {
+        unsafe {
+            if psram_size < PSRAM_BYTES_REQUIRED {
+                return None;
+            }
+            let a = psram_ptr;
+            let b = psram_ptr.add(BYTES);
+
+            let fb = Self {
+                a,
+                b,
+                back_is_a: AtomicBool::new(false),
+            };
+
+            fb.fill_buffer(a, 0x0000);
+            fb.fill_buffer(b, 0x0000);
+
+            Some((a, fb))
+        }
+    }
+
+    fn back_ptr(&self) -> *mut u8 {
+        if self.back_is_a.load(Ordering::Acquire) {
+            self.a
+        } else {
+            self.b
+        }
+    }
+
+    /// Return the raw `(a, b)` PSRAM pointers for low-level diagnostics.
+    pub fn raw_buffers(&self) -> (*mut u8, *mut u8) {
+        (self.a, self.b)
+    }
+
+    /// Write a span of `range.len()` RGB565 pixels into row `y` of the back buffer
+    /// and flush those cache lines back to physical PSRAM.
+    pub fn write_row(&self, y: usize, range: Range<usize>, pixels: &[u16]) {
+        if y >= HEIGHT {
+            return;
+        }
+        let end = range.end.min(WIDTH);
+        if range.start >= end {
+            return;
+        }
+        let n = (end - range.start).min(pixels.len());
+        unsafe {
+            let dst = (self.back_ptr() as *mut u16).add(y * WIDTH + range.start);
+            for i in 0..n {
+                dst.add(i).write_volatile(pixels[i]);
+            }
+            cache_writeback(dst as u32, (n * core::mem::size_of::<u16>()) as u32);
+        }
+    }
+
+    /// Fill the back buffer with a single RGB565 colour.
+    pub fn fill(&self, colour: u16) {
+        self.fill_buffer(self.back_ptr(), colour);
+    }
+
+    /// Paint a horizontal solid-colour run on row `y`, columns `x_range`.
+    pub fn draw_row_solid(&self, y: usize, x_range: Range<usize>, colour: u16) {
+        if y >= HEIGHT {
+            return;
+        }
+        let end = x_range.end.min(WIDTH);
+        if x_range.start >= end {
+            return;
+        }
+        let n = end - x_range.start;
+        unsafe {
+            let dst = (self.back_ptr() as *mut u16).add(y * WIDTH + x_range.start);
+            for i in 0..n {
+                dst.add(i).write_volatile(colour);
+            }
+            cache_writeback(dst as u32, (n * core::mem::size_of::<u16>()) as u32);
+        }
+    }
+
+    /// Paint a vertical solid-colour run at column `x`, rows `y_range`.
+    pub fn draw_column(&self, x: usize, y_range: Range<usize>, colour: u16) {
+        if x >= WIDTH {
+            return;
+        }
+        let end = y_range.end.min(HEIGHT);
+        if y_range.start >= end {
+            return;
+        }
+        unsafe {
+            let base = self.back_ptr() as *mut u16;
+            for y in y_range.start..end {
+                base.add(y * WIDTH + x).write_volatile(colour);
+            }
+            let start_addr = base.add(y_range.start * WIDTH + x) as u32;
+            let end_addr = base.add((end - 1) * WIDTH + x).add(1) as u32;
+            cache_writeback(start_addr, end_addr - start_addr);
+        }
+    }
+
+    fn fill_buffer(&self, base: *mut u8, colour: u16) {
+        unsafe {
+            let lo = (colour & 0xFF) as u8;
+            let hi = (colour >> 8) as u8;
+            if lo == hi {
+                core::ptr::write_bytes(base, lo, BYTES);
+            } else {
+                let dst = base as *mut u16;
+                for i in 0..(WIDTH * HEIGHT) {
+                    core::ptr::write(dst.add(i), colour);
+                }
+            }
+            cache_writeback(base as u32, BYTES as u32);
+        }
+    }
+
+    /// Tear-free swap of front and back buffers.
+    pub fn flip(&self) {
+        let was_back_a = self.back_is_a.load(Ordering::Acquire);
+        let new_front = if was_back_a { self.a } else { self.b };
+
+        while crate::bounce_buffer::is_flip_pending() {
+            core::hint::spin_loop();
+        }
+
+        crate::bounce_buffer::request_flip(new_front);
+
+        while crate::bounce_buffer::is_flip_pending() {
+            core::hint::spin_loop();
+        }
+
+        self.back_is_a.store(!was_back_a, Ordering::Release);
+    }
+
+    /// Queue a swap and return immediately without waiting for the ISR to apply it.
+    pub fn flip_no_sync(&self) {
+        let was_back_a = self.back_is_a.load(Ordering::Acquire);
+        let new_front = if was_back_a { self.a } else { self.b };
+        crate::bounce_buffer::request_flip(new_front);
+        self.back_is_a.store(!was_back_a, Ordering::Release);
+    }
+}
+
+/// Flush L1 D-cache lines covering `[addr, addr + size)` back to physical PSRAM.
+///
+/// # Safety
+///
+/// `addr` must be in a PSRAM-mapped address range and `size` within bounds.
+#[inline]
+pub(crate) unsafe fn cache_writeback(addr: u32, size: u32) {
+    unsafe {
+        unsafe extern "C" {
+            fn rom_Cache_WriteBack_Addr(addr: u32, size: u32);
+            fn Cache_Suspend_DCache_Autoload() -> u32;
+            fn Cache_Resume_DCache_Autoload(value: u32);
+        }
+        let autoload = Cache_Suspend_DCache_Autoload();
+        rom_Cache_WriteBack_Addr(addr, size);
+        Cache_Resume_DCache_Autoload(autoload);
+    }
+}
+
+#[cfg(feature = "embedded-graphics")]
+mod eg_support {
+    use super::{Framebuffer, HEIGHT, WIDTH, cache_writeback};
+    use core::convert::Infallible;
+    use embedded_graphics_core::{
+        Pixel,
+        draw_target::DrawTarget,
+        geometry::{Dimensions, OriginDimensions, Size},
+        pixelcolor::{
+            Rgb565,
+            raw::{RawData, RawU16},
+        },
+        primitives::Rectangle,
+    };
+
+    impl OriginDimensions for Framebuffer {
+        fn size(&self) -> Size {
+            Size::new(WIDTH as u32, HEIGHT as u32)
+        }
+    }
+
+    impl DrawTarget for Framebuffer {
+        type Color = Rgb565;
+        type Error = Infallible;
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            let base = self.back_ptr() as *mut u16;
+            let mut min_y = HEIGHT;
+            let mut max_y = 0usize;
+
+            for Pixel(coord, color) in pixels {
+                if coord.x >= 0
+                    && coord.y >= 0
+                    && (coord.x as usize) < WIDTH
+                    && (coord.y as usize) < HEIGHT
+                {
+                    let x = coord.x as usize;
+                    let y = coord.y as usize;
+                    let raw = RawU16::from(color).into_inner();
+                    unsafe {
+                        base.add(y * WIDTH + x).write_volatile(raw);
+                    }
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y + 1);
+                }
+            }
+
+            if min_y < max_y {
+                unsafe {
+                    let start = base.add(min_y * WIDTH) as u32;
+                    let size = ((max_y - min_y) * WIDTH * core::mem::size_of::<u16>()) as u32;
+                    cache_writeback(start, size);
+                }
+            }
+            Ok(())
+        }
+
+        fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+            let clipped = area.intersection(&self.bounding_box());
+            if clipped.is_zero_sized() {
+                return Ok(());
+            }
+            let raw = RawU16::from(color).into_inner();
+            let x0 = clipped.top_left.x as usize;
+            let x1 = x0 + clipped.size.width as usize;
+            let y0 = clipped.top_left.y as usize;
+            let y1 = y0 + clipped.size.height as usize;
+            for y in y0..y1 {
+                self.draw_row_solid(y, x0..x1, raw);
+            }
+            Ok(())
+        }
+
+        fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+            self.fill(RawU16::from(color).into_inner());
+            Ok(())
+        }
+    }
+}

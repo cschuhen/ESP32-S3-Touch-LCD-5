@@ -1,38 +1,31 @@
-# ESP32-S3-Touch-LCD-2.8C
+# ESP32-S3-Touch-LCD-5
 
-Rust drivers for the [Waveshare ESP32-S3-Touch-LCD-2.8C][board] — a 2.8"
-round 480×480 IPS panel with a Goodix GT911 capacitive touch overlay,
-mounted on an ESP32-S3 carrier board.
-
-[board]: https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2.8C
+Rust drivers and board-support package for the **Waveshare ESP32-S3-Touch-LCD-5** (Rev 1.2, 800×480 RGB565 IPS panel, optional `panel-1024x600` feature for the 5B variant), with a Goodix GT911 capacitive touch controller and WCH CH422G I²C I/O expander on an ESP32-S3-WROOM-1-N16R8.
 
 ## Crates
 
-This workspace publishes two crates. Pick the one(s) you need:
-
-| Crate | What it gives you | Depends on |
+| Crate | Purpose | Dependencies |
 |---|---|---|
-| [`st7701`](crates/st7701) | Generic Sitronix ST7701 init driver — bit-banged 9-bit 3-wire SPI over `embedded-hal` `OutputPin` + `DelayNs`. Includes the Waveshare-2.8C init sequence as a preset. Works on **any HAL**. | `embedded-hal 1.0` |
-| [`ws-esp32-s3-touch-lcd-2-8c`](crates/ws-esp32-s3-touch-lcd-2-8c) | Board-support package for this exact board. One call wires up: ST7701 init, PCA9554 I/O expander, GT911 touch reset, DPI peripheral, PSRAM framebuffer, and the DRAM bounce-buffer ring needed to avoid the PSRAM→DPI drift on this SoC. | `esp-hal 1.0.0-rc.0`, `st7701`, [`port-expander`](https://crates.io/crates/port-expander), [`gt911`](https://crates.io/crates/gt911) |
+| [`ch422g`](crates/ch422g) | Minimal `no_std` driver for the WCH CH422G I²C I/O expander (`0x24` / `0x38` single-byte protocol, shadow-register tracking, optional `async`). | `embedded-hal 1.0`, `embedded-hal-async 1.0` |
+| [`ws-esp32-s3-touch-lcd-5`](crates/ws-esp32-s3-touch-lcd-5) | Full ESP32-S3 BSP: CH422G reset & backlight (`DISP`), GT911 touch (`0x5D`), `LCD_CAM` DPI RGB565, double-buffered Octal PSRAM framebuffer, and DRAM GDMA bounce-buffer ring. | `esp-hal 1.0.0-rc.0`, `ch422g`, `gt911` |
 
-Existing community crates cover the other two chips on the board:
+## Examples & Hardware Verification
 
-- [`port-expander`](https://crates.io/crates/port-expander) — PCA9554
-  I²C I/O expander (drives the LCD reset, ST7701 CS, and touch reset).
-- [`gt911`](https://crates.io/crates/gt911) — Goodix GT911 capacitive
-  touch controller.
+From `crates/ws-esp32-s3-touch-lcd-5`:
 
-The BSP crate re-exports those, so a downstream user only needs to
-`cargo add ws-esp32-s3-touch-lcd-2-8c`.
+```sh
+# 1. Autonomous hardware-in-the-loop self-test (PSRAM, CH422G, GT911, DPI regs, ISR, flip)
+cargo +esp run --release --example selftest_hw --features _example-runtime
 
-## Picking a crate
+# 2. Solid colour & backlight test
+cargo +esp run --release --example hello_backlight --features _example-runtime
 
-- **Just want the LCD on a different HAL** (rp2040, stm32, …):
-  `cargo add st7701` and supply your own pin types.
-- **Touch only** (any board): `cargo add gt911`.
-- **PCA9554 only** (any board): `cargo add port-expander`.
-- **The full Waveshare 2.8C, ESP32-S3 target**:
-  `cargo add ws-esp32-s3-touch-lcd-2-8c`.
+# 3. 1-px border & RGB gradient calibration pattern
+cargo +esp run --release --example hello_pattern --features _example-runtime
+
+# 4. Interactive GT911 touch crosshairs
+cargo +esp run --release --example hello_touch --features _example-runtime
+```
 
 ## License
 

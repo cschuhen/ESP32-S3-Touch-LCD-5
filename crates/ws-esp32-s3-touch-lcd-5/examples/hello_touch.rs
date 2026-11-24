@@ -16,8 +16,8 @@
 //! Build & flash:
 //!
 //! ```sh
-//! cd crates/ws-esp32-s3-touch-lcd-2-8c
-//! cargo run --release --example hello_touch
+//! cd crates/ws-esp32-s3-touch-lcd-5
+//! cargo +esp run --release --example hello_touch --features _example-runtime
 //! ```
 //!
 //! Requires `espflash` and the Espressif Rust toolchain (`espup install`).
@@ -27,7 +27,7 @@
 
 extern crate alloc;
 use esp_backtrace as _;
-use ws_esp32_s3_touch_lcd_2_8c as bsp;
+use ws_esp32_s3_touch_lcd_5 as bsp;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -56,10 +56,12 @@ struct Press {
 #[esp_hal_embassy::main]
 async fn main(_spawner: embassy_executor::Spawner) {
     let peripherals = esp_hal::init(
-        esp_hal::Config::default().with_psram(esp_hal::psram::PsramConfig {
-            size: esp_hal::psram::PsramSize::Size(8 * 1024 * 1024),
-            ..Default::default()
-        }),
+        esp_hal::Config::default()
+            .with_cpu_clock(esp_hal::clock::CpuClock::max())
+            .with_psram(esp_hal::psram::PsramConfig {
+                size: esp_hal::psram::PsramSize::Size(8 * 1024 * 1024),
+                ..Default::default()
+            }),
     );
 
     esp_alloc::heap_allocator!(size: 64 * 1024);

@@ -1,0 +1,14 @@
+[package]
+name        = "ch422g"
+description = "Minimal no_std driver for the WCH CH422G I2C I/O expander (embedded-hal 1.0 + optional async)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+async   = ["dep:embedded-hal-async"]
+
+[dependencies]
+embedded-hal       = { workspace = true }
+embedded-hal-async = { workspace = true, optional = true }

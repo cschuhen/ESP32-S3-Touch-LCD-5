@@ -1,0 +1,62 @@
+[package]
+name        = "ws-esp32-s3-touch-lcd-5"
+description = "Board-support package for the Waveshare ESP32-S3-Touch-LCD-5 (800x480 / 1024x600 RGB IPS + GT911 + CH422G)."
+categories  = ["embedded", "no-std", "hardware-support"]
+keywords    = ["esp32", "embedded", "bsp", "waveshare", "rgb-lcd"]
+readme      = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+test = false # no_std, xtensa-esp32s3-none-elf only
+
+[[example]]
+name              = "selftest_hw"
+required-features = ["_example-runtime"]
+
+[[example]]
+name              = "hello_backlight"
+required-features = ["_example-runtime"]
+
+[[example]]
+name              = "hello_pattern"
+required-features = ["_example-runtime"]
+
+[[example]]
+name              = "hello_touch"
+required-features = ["_example-runtime"]
+
+[features]
+default = []
+# Override default 800x480 (Rev 1.2) timings & framebuffer dimensions for the 5B 1024x600 panel.
+panel-1024x600 = []
+# Optional embedded-graphics DrawTarget support on Framebuffer.
+embedded-graphics = ["dep:embedded-graphics-core"]
+# Internal gate for example-only runtime dependencies.
+_example-runtime = []
+
+[dependencies]
+ch422g               = { version = "0.1", path = "../ch422g", features = ["async"] }
+gt911                = { version = "0.3", default-features = false }
+embedded-hal         = { workspace = true }
+embedded-hal-async   = { workspace = true }
+embedded-graphics-core = { version = "0.4", optional = true }
+critical-section     = "1"
+log                  = "0.4"
+embassy-sync         = "0.8"
+embassy-embedded-hal = "0.6"
+embassy-time         = "0.4"
+static_cell          = "2.1"
+esp-hal              = { version = "=1.0.0-rc.0", features = ["esp32s3", "unstable", "psram"] }
+
+[dev-dependencies]
+esp-hal-embassy        = { version = "0.9.1",  features = ["esp32s3"] }
+esp-backtrace          = { version = "0.18.1", features = ["esp32s3", "panic-handler", "println"] }
+esp-println            = { version = "0.16.1", features = ["esp32s3", "log-04"] }
+esp-bootloader-esp-idf = { version = "0.3",    features = ["esp32s3"] }
+esp-alloc              = "0.9"
+embassy-executor       = "0.7"
+embassy-time           = "0.4"
+embedded-graphics      = "0.8"
+heapless               = "0.8"

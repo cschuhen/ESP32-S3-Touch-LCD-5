@@ -1,0 +1,13 @@
+cd crates/ws-esp32-s3-touch-lcd-5
+
+# 1. Autonomous hardware self-test (PSRAM, CH422G, GT911, LCD_CAM regs, ISR cadence, flip, I2C stress)
+cargo +esp run --release --example selftest_hw --features _example-runtime
+
+# 2. Visual backlight & RGB colour check
+cargo +esp run --release --example hello_backlight --features _example-runtime
+
+# 3. 1-px border & gradient calibration
+cargo +esp run --release --example hello_pattern --features _example-runtime
+
+# 4. Interactive touch crosshairs
+cargo +esp run --release --example hello_touch --features _example-runtime
