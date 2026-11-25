@@ -5,6 +5,7 @@
 
 #![no_std]
 #![deny(missing_docs)]
+#![feature(asm_experimental_arch)]
 
 mod bounce_buffer;
 mod framebuffer;
@@ -42,7 +43,7 @@ use esp_hal::{
 pub use ch422g;
 pub use gt911;
 
-pub use bounce_buffer::BounceRing;
+pub use bounce_buffer::{BounceRing, IsrStats};
 pub use framebuffer::{
     Framebuffer, BYTES as FRAMEBUFFER_BYTES, HEIGHT, PSRAM_BYTES_REQUIRED, WIDTH,
 };
@@ -54,6 +55,7 @@ pub struct Resources<'d> {
     pub lcd_cam:   peripherals::LCD_CAM<'d>,
     pub dma_ch0:   peripherals::DMA_CH0<'d>,
     pub psram:     peripherals::PSRAM<'d>,
+    pub cpu_ctrl:  peripherals::CPU_CTRL<'d>,
 
     pub sda:       peripherals::GPIO8<'d>,
     pub scl:       peripherals::GPIO9<'d>,
@@ -97,6 +99,7 @@ macro_rules! take_resources {
             lcd_cam:   $p.LCD_CAM,
             dma_ch0:   $p.DMA_CH0,
             psram:     $p.PSRAM,
+            cpu_ctrl:  $p.CPU_CTRL,
             sda:       $p.GPIO8,
             scl:       $p.GPIO9,
             touch_int: $p.GPIO4,
@@ -144,6 +147,8 @@ pub enum Error {
     PsramTooSmall,
     /// DPI DMA transfer failed to start.
     DpiStart,
+    /// Failed to start Core 1 for the DPI bounce-buffer ISR.
+    Core1Start,
 }
 
 /// Bring up the Waveshare ESP32-S3-Touch-LCD-5 board.
@@ -245,7 +250,8 @@ pub fn init(r: Resources<'static>) -> Result<Board, Error> {
     // ----- Start continuous DPI DMA transfer + EOF ISR ---------------------
     let transfer = dpi.send(true, bounce).map_err(|_| Error::DpiStart)?;
     core::mem::forget(transfer);
-    unsafe { bounce_buffer::enable_eof_interrupt() };
+    unsafe { bounce_buffer::enable_eof_interrupt_on_core1(r.cpu_ctrl) }
+        .map_err(|_| Error::Core1Start)?;
 
     // ----- Backlight ON (EXIO2 = 1) ----------------------------------------
     ch.write_all(&mut i2c, consts::ch422g_pins::MASK_ACTIVE)

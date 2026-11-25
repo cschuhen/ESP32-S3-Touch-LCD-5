@@ -81,11 +81,12 @@ You also need a `.cargo/config.toml` with `target = "xtensa-esp32s3-none-elf"`,
    `WR_SET` (`0x24 <- 0x01`), then releases `TP_RST` and `LCD_RST` and floats
    `GPIO4` so GT911 latches address `0x5D`.
 3. Probes GT911 (`Gt911Blocking::default().init(&mut i2c)`).
-4. Configures `LCD_CAM` DPI at 16 MHz PCLK (`Phase::ShiftHigh`, 800×480 active,
-   820×500 total; or 21 MHz / 1024×600 with `panel-1024x600`).
+4. Configures `LCD_CAM` DPI at 12 MHz PCLK (~29 Hz, `Phase::ShiftHigh`, 800×480
+   active, 820×500 total; or 21 MHz / 1024×600 with `panel-1024x600`).
 5. Allocates two contiguous framebuffers in Octal PSRAM (1.5 MiB total at
    800×480), builds a closed DRAM GDMA bounce-buffer ring (`16` lines/half,
-   `51.2 KiB` DRAM), starts continuous DMA, and enables `DMA_OUT_CH0` `OUT_EOF`.
+   `51.2 KiB` DRAM), starts continuous DMA, and launches Core 1 (`CPU_CTRL`) to
+   service `DMA_OUT_CH0` `OUT_EOF` refills — leaving Core 0 free for your app.
 6. Turns on the backlight (`DISP` = `EXIO2` high) and converts `I2C0` to async
    (`SharedI2c` + `SharedCh422g`).
 
@@ -103,8 +104,10 @@ You also need a `.cargo/config.toml` with `target = "xtensa-esp32s3-none-elf"`,
 
 - **Run the CPU at 240 MHz (`CpuClock::max()`).** `esp-hal 1.0.0-rc.0` defaults
   to 80 MHz, which is too slow for the bounce-buffer ISR at 16 MHz PCLK.
-- **Octal PSRAM mode is mandatory.** Set `ESP_HAL_CONFIG_PSRAM_MODE = "octal"`
-  in `.cargo/config.toml`.
+- **Octal PSRAM mode (40 MHz default).** Set `ESP_HAL_CONFIG_PSRAM_MODE = "octal"`
+  in `.cargo/config.toml` and leave `PsramConfig::ram_frequency` at its default
+  40 MHz (`esp-hal 1.0.0-rc.0` does not implement MSPI timing tuning for 80 MHz
+  Octal DDR PSRAM).
 - **Call `init` at most once per boot.** The bounce-buffer ring and EOF ISR use
   module-level statics, and the DPI DMA transfer is intentionally leaked.
 - **Pinned to `esp-hal = "=1.0.0-rc.0"`** for `esp-hal-embassy 0.9.1`

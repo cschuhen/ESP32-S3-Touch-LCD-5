@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use ws_esp32_s3_touch_lcd_5 as bsp;
 
@@ -90,11 +90,26 @@ async fn main(_spawner: embassy_executor::Spawner) {
     fb.flip();
     log::info!("test pattern drawn ({}x{})", w, h);
 
-    let mut prev = bsp::BounceRing::isr_fires();
+    let _ = bsp::BounceRing::take_isr_stats(1000);
+    let mut core0_busy_us: u64 = 0;
     loop {
         Timer::after(Duration::from_secs(1)).await;
-        let now = bsp::BounceRing::isr_fires();
-        log::info!("isr_fires/s = {} (total = {})", now.wrapping_sub(prev), now);
-        prev = now;
+        let t0 = Instant::now();
+        let st = bsp::BounceRing::take_isr_stats(1000);
+        let core0_tenths =
+            (core0_busy_us / 1_000) + if st.core == 0 { st.cpu_pct as u64 * 10 } else { 0 };
+        let core1_pct = if st.core == 1 { st.cpu_pct } else { 0 };
+        log::info!(
+            "cpu: core0={}.{}% ({} us/s) | core1={}% (isr on core {}: {} fires/s, avg={} us, max={} us)",
+            core0_tenths / 10,
+            core0_tenths % 10,
+            core0_busy_us,
+            core1_pct,
+            st.core,
+            st.fires,
+            st.avg_us,
+            st.max_us
+        );
+        core0_busy_us = t0.elapsed().as_micros();
     }
 }

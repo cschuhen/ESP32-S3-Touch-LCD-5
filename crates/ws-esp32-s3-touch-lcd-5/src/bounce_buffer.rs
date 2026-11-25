@@ -3,16 +3,20 @@
 //! Two small DRAM bounce buffers (`BOUNCE_A`, `BOUNCE_B`) sit between the PSRAM
 //! master framebuffer and the `LCD_CAM` GDMA channel so GDMA never reads PSRAM
 //! directly (which causes diagonal refresh-drift stripes on ESP32-S3).
+//!
+//! The entire EOF ISR and copy loop are placed in IRAM (`#[esp_hal::ram]`) so
+//! SPI Flash cache evictions never stall a bounce-buffer refill.
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
 
 use esp_hal::dma::{
     BurstConfig, DmaDescriptor, DmaTxBuffer, Owner, Preparation, TransferDirection,
 };
 use esp_hal::interrupt::{self, Priority};
 use esp_hal::peripherals::Interrupt;
+use esp_hal::system::{Cpu, CpuControl, Stack};
 
 use crate::framebuffer::{self, WIDTH};
 
@@ -37,16 +41,18 @@ pub const HALVES_PER_FRAME: usize = framebuffer::BYTES / HALF_BYTES;
 
 /// Coarse startup offset in halves (0 by default; calibrate on hardware if needed).
 const STARTUP_OFFSET_HALVES: usize = 0;
-/// Fine startup offset in scanlines (0 by default; calibrate with `hello_pattern`).
+/// Fine startup offset in scanlines (0 by default; calibrated with `hello_pattern`).
 const STARTUP_OFFSET_LINES: usize = 0;
 const STARTUP_OFFSET_BYTES: usize = STARTUP_OFFSET_LINES * WIDTH * 2;
 
 /// Total descriptors in the frame-sized ring.
 const N_DESC: usize = DESC_PER_HALF * HALVES_PER_FRAME;
 
-// Compile-time invariants for alternating A/B bounce-buffer wrapping.
+// Compile-time invariants for alternating A/B bounce-buffer wrapping & 16-byte IRAM copy.
 const _: () = assert!(framebuffer::BYTES % HALF_BYTES == 0);
 const _: () = assert!(HALVES_PER_FRAME % 2 == 0);
+const _: () = assert!(HALF_BYTES % 16 == 0);
+const _: () = assert!(STARTUP_OFFSET_BYTES % 16 == 0);
 
 #[repr(align(64))]
 struct BounceHalf([u8; HALF_BYTES]);
@@ -58,6 +64,27 @@ static mut DESCRIPTORS: [DmaDescriptor; N_DESC] = [DmaDescriptor::EMPTY; N_DESC]
 static PSRAM_FB_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static PENDING_SWAP: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static EOF_COUNT: AtomicU32 = AtomicU32::new(0);
+static STAT_FIRES: AtomicU32 = AtomicU32::new(0);
+static STAT_CYCLES_SUM: AtomicU32 = AtomicU32::new(0);
+static STAT_CYCLES_MAX: AtomicU32 = AtomicU32::new(0);
+static STAT_ISR_CORE: AtomicU8 = AtomicU8::new(0);
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+static CORE1_READY: AtomicBool = AtomicBool::new(false);
+
+/// ISR execution telemetry snapshot returned by [`BounceRing::take_isr_stats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IsrStats {
+    /// CPU core ID (`0` = PRO/Core 0, `1` = APP/Core 1) that serviced the EOF ISR.
+    pub core: u8,
+    /// Number of EOF interrupts recorded since the previous call.
+    pub fires: u32,
+    /// Mean ISR execution time in microseconds (assuming 240 MHz CPU clock).
+    pub avg_us: u32,
+    /// Worst-case single ISR execution time in microseconds (assuming 240 MHz CPU clock).
+    pub max_us: u32,
+    /// Estimated single-core CPU utilization percentage (`0..=100`, assuming 240 MHz over `window_ms`).
+    pub cpu_pct: u32,
+}
 
 /// Custom `DmaTxBuffer` wrapping the closed frame-sized DRAM descriptor ring.
 pub struct BounceRing {
@@ -111,6 +138,9 @@ impl BounceRing {
 
             PSRAM_FB_PTR.store(psram_fb_ptr as *mut u8, Ordering::Release);
             EOF_COUNT.store(0, Ordering::Relaxed);
+            STAT_FIRES.store(0, Ordering::Relaxed);
+            STAT_CYCLES_SUM.store(0, Ordering::Relaxed);
+            STAT_CYCLES_MAX.store(0, Ordering::Relaxed);
 
             Self { head: descs_base }
         }
@@ -124,6 +154,28 @@ impl BounceRing {
     /// Total EOF interrupts fired since transfer start.
     pub fn isr_fires() -> u32 {
         EOF_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Read and reset the accumulated ISR cycle stats over `window_ms` (at 240 MHz CPU clock).
+    pub fn take_isr_stats(window_ms: u32) -> IsrStats {
+        let fires = STAT_FIRES.swap(0, Ordering::Relaxed);
+        let sum = STAT_CYCLES_SUM.swap(0, Ordering::Relaxed);
+        let max = STAT_CYCLES_MAX.swap(0, Ordering::Relaxed);
+
+        if fires == 0 || window_ms == 0 {
+            return IsrStats::default();
+        }
+        const CYCLES_PER_US: u32 = 240;
+        let avg_cycles = sum / fires;
+        let window_cycles = (window_ms as u64) * 240_000;
+        let cpu_pct = (((sum as u64) * 100) / window_cycles) as u32;
+        IsrStats {
+            core: STAT_ISR_CORE.load(Ordering::Relaxed),
+            fires,
+            avg_us: avg_cycles / CYCLES_PER_US,
+            max_us: max / CYCLES_PER_US,
+            cpu_pct,
+        }
     }
 }
 
@@ -168,7 +220,7 @@ pub fn is_flip_pending() -> bool {
 pub unsafe fn enable_eof_interrupt() {
     unsafe {
         interrupt::bind_interrupt(Interrupt::DMA_OUT_CH0, eof_isr_trampoline);
-        interrupt::enable(Interrupt::DMA_OUT_CH0, Priority::Priority2)
+        interrupt::enable(Interrupt::DMA_OUT_CH0, Priority::Priority3)
             .expect("DMA_OUT_CH0 enable");
 
         let dma = &*esp_hal::peripherals::DMA::PTR;
@@ -179,11 +231,66 @@ pub unsafe fn enable_eof_interrupt() {
     }
 }
 
+/// Start Core 1 (APP CPU), bind and enable `DMA_OUT_CH0` `OUT_EOF` on Core 1,
+/// and park Core 1 in `waiti 0` so all bounce-buffer refills run on Core 1.
+///
+/// # Safety
+///
+/// Must be called once outside interrupt context after the DPI transfer has started.
+pub unsafe fn enable_eof_interrupt_on_core1(
+    cpu_ctrl: esp_hal::peripherals::CPU_CTRL<'static>,
+) -> Result<(), ()> {
+    CORE1_READY.store(false, Ordering::Release);
+    let mut cpu_control = CpuControl::new(cpu_ctrl);
+    let guard = cpu_control
+        .start_app_core(unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) }, || {
+            unsafe {
+                interrupt::bind_interrupt(Interrupt::DMA_OUT_CH0, eof_isr_trampoline);
+            }
+            interrupt::enable(Interrupt::DMA_OUT_CH0, Priority::Priority3)
+                .expect("DMA_OUT_CH0 enable on core 1");
+
+            let dma = unsafe { &*esp_hal::peripherals::DMA::PTR };
+            dma.ch(0)
+                .out_int()
+                .ena()
+                .modify(|_, w| w.out_eof().set_bit());
+
+            CORE1_READY.store(true, Ordering::Release);
+            loop {
+                unsafe {
+                    core::arch::asm!("waiti 0", options(nomem, nostack));
+                }
+            }
+        })
+        .map_err(|_| ())?;
+
+    // Keep Core 1 running permanently; dropping `guard` would park Core 1.
+    core::mem::forget(guard);
+
+    while !CORE1_READY.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn read_ccount() -> u32 {
+    let cycles: u32;
+    unsafe {
+        core::arch::asm!("rsr.ccount {0}", out(reg) cycles, options(nomem, nostack));
+    }
+    cycles
+}
+
+#[esp_hal::ram]
 unsafe extern "C" fn eof_isr_trampoline() {
     eof_isr();
 }
 
+#[esp_hal::ram]
 fn eof_isr() {
+    let t0 = read_ccount();
     let dma = unsafe { &*esp_hal::peripherals::DMA::PTR };
 
     if !dma.ch(0).out_int().st().read().out_eof().bit_is_set() {
@@ -233,9 +340,37 @@ fn eof_isr() {
         .out_int()
         .clr()
         .write(|w| w.out_eof().clear_bit_by_one());
+
+    let elapsed = read_ccount().wrapping_sub(t0);
+    STAT_ISR_CORE.store(Cpu::current() as u8, Ordering::Relaxed);
+    STAT_FIRES.fetch_add(1, Ordering::Relaxed);
+    STAT_CYCLES_SUM.fetch_add(elapsed, Ordering::Relaxed);
+    let _ = STAT_CYCLES_MAX.fetch_max(elapsed, Ordering::Relaxed);
 }
 
-#[inline]
+/// 16-byte-unrolled copy so the ISR never calls Flash-resident `memcpy`
+/// (inlined into `#[esp_hal::ram] fn eof_isr`).
+#[inline(always)]
+unsafe fn copy_aligned_16(mut src: *const u32, mut dst: *mut u32, bytes: usize) {
+    let mut quads = bytes / 16;
+    unsafe {
+        while quads > 0 {
+            let w0 = src.read();
+            let w1 = src.add(1).read();
+            let w2 = src.add(2).read();
+            let w3 = src.add(3).read();
+            dst.write(w0);
+            dst.add(1).write(w1);
+            dst.add(2).write(w2);
+            dst.add(3).write(w3);
+            src = src.add(4);
+            dst = dst.add(4);
+            quads -= 1;
+        }
+    }
+}
+
+#[inline(always)]
 unsafe fn psram_copy_wrapping(psram_base: *const u8, chunk_idx: usize, dest: *mut u8) {
     unsafe {
         let natural = chunk_idx * HALF_BYTES;
@@ -243,12 +378,24 @@ unsafe fn psram_copy_wrapping(psram_base: *const u8, chunk_idx: usize, dest: *mu
         let end = start + HALF_BYTES;
 
         if end <= framebuffer::BYTES {
-            core::ptr::copy_nonoverlapping(psram_base.add(start), dest, HALF_BYTES);
+            copy_aligned_16(
+                psram_base.add(start) as *const u32,
+                dest as *mut u32,
+                HALF_BYTES,
+            );
         } else {
             let first = framebuffer::BYTES - start;
             let second = HALF_BYTES - first;
-            core::ptr::copy_nonoverlapping(psram_base.add(start), dest, first);
-            core::ptr::copy_nonoverlapping(psram_base, dest.add(first), second);
+            copy_aligned_16(
+                psram_base.add(start) as *const u32,
+                dest as *mut u32,
+                first,
+            );
+            copy_aligned_16(
+                psram_base as *const u32,
+                dest.add(first) as *mut u32,
+                second,
+            );
         }
     }
 }

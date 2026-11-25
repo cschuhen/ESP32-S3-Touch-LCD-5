@@ -51,7 +51,7 @@ pub mod touch {
 #[cfg(not(feature = "panel-1024x600"))]
 pub mod dpi {
     /// Pixel clock frequency in MHz.
-    pub const PCLK_MHZ: u32 = 16;
+    pub const PCLK_MHZ: u32 = 12;
     /// Horizontal active width (pixels).
     pub const H_ACTIVE: usize = 800;
     /// HSYNC pulse width (PCLKs).

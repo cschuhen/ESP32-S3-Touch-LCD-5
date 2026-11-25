@@ -181,21 +181,40 @@ fn check_dpi_regs() -> bool {
 }
 
 async fn check_isr_cadence() -> bool {
+    let _ = bsp::BounceRing::take_isr_stats(1000);
     let start = bsp::BounceRing::isr_fires();
     Timer::after(Duration::from_millis(1000)).await;
     let end = bsp::BounceRing::isr_fires();
     let delta = end.wrapping_sub(start);
+    let st = bsp::BounceRing::take_isr_stats(1000);
 
     let dma = unsafe { &*esp_hal::peripherals::DMA::PTR };
     let dscr_err = dma.ch(0).out_int().raw().read().out_dscr_err().bit_is_set();
 
-    let ok = !dscr_err && (1100..=1350).contains(&delta);
+    let halves = bsp::BounceRing::dimensions().2 as u64;
+    let expected = ((bsp::consts::dpi::PCLK_MHZ as u64 * 1_000_000 * halves)
+        / (bsp::consts::dpi::H_TOTAL as u64 * bsp::consts::dpi::V_TOTAL as u64)) as u32;
+    let min_eof = expected * 92 / 100;
+    let max_eof = expected * 108 / 100;
+
+    let ok = !dscr_err && st.core == 1 && (min_eof..=max_eof).contains(&delta);
     if ok {
-        log::info!("[PASS] isr_cadence: {} EOFs/sec, out_dscr_err=false", delta);
+        log::info!(
+            "[PASS] isr_cadence: {} EOFs/sec (expected ~{}), isr_core={}, avg={} us, max={} us, core1_cpu={} %, out_dscr_err=false",
+            delta,
+            expected,
+            st.core,
+            st.avg_us,
+            st.max_us,
+            st.cpu_pct
+        );
     } else {
         log::error!(
-            "[FAIL] isr_cadence: {} EOFs/sec, out_dscr_err={}",
+            "[FAIL] isr_cadence: {} EOFs/sec (expected {}..={}), isr_core={}, out_dscr_err={}",
             delta,
+            min_eof,
+            max_eof,
+            st.core,
             dscr_err
         );
     }
@@ -210,7 +229,7 @@ fn check_fb_flip(fb: &bsp::Framebuffer) -> bool {
         let dt = t0.elapsed().as_millis();
         max_ms = max_ms.max(dt);
     }
-    let ok = (10..=50).contains(&max_ms);
+    let ok = (15..=65).contains(&max_ms);
     if ok {
         log::info!("[PASS] fb_flip_sync: 5 flips completed (max {} ms)", max_ms);
     } else {
