@@ -70,6 +70,13 @@ static STAT_CYCLES_MAX: AtomicU32 = AtomicU32::new(0);
 static STAT_ISR_CORE: AtomicU8 = AtomicU8::new(0);
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 static CORE1_READY: AtomicBool = AtomicBool::new(false);
+static ISR_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PACE_LAST_EOF: AtomicU32 = AtomicU32::new(0);
+static PACE_BYTES: AtomicU32 = AtomicU32::new(0);
+
+/// Max Core 0 PSRAM write budget per EOF interval (~128 dirty 32-byte cache lines),
+/// keeping Core 1's shared-cache refill comfortably below the 1,093 us deadline.
+const MAX_CORE0_BYTES_PER_EOF: u32 = 4096;
 
 /// ISR execution telemetry snapshot returned by [`BounceRing::take_isr_stats`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -141,6 +148,9 @@ impl BounceRing {
             STAT_FIRES.store(0, Ordering::Relaxed);
             STAT_CYCLES_SUM.store(0, Ordering::Relaxed);
             STAT_CYCLES_MAX.store(0, Ordering::Relaxed);
+            ISR_ACTIVE.store(false, Ordering::Release);
+            PACE_LAST_EOF.store(0, Ordering::Relaxed);
+            PACE_BYTES.store(0, Ordering::Relaxed);
 
             Self { head: descs_base }
         }
@@ -274,6 +284,42 @@ pub unsafe fn enable_eof_interrupt_on_core1(
     Ok(())
 }
 
+/// Pace Core 0 PSRAM writes so they do not overlap Core 1's `eof_isr` or exceed
+/// [`MAX_CORE0_BYTES_PER_EOF`] dirty bytes in a single EOF window.
+#[esp_hal::ram]
+pub(crate) fn pace_psram_write(bytes: usize) {
+    if !CORE1_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    while ISR_ACTIVE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let req = (bytes as u32).min(MAX_CORE0_BYTES_PER_EOF);
+    let eof_now = EOF_COUNT.load(Ordering::Acquire);
+    let last_eof = PACE_LAST_EOF.load(Ordering::Relaxed);
+
+    if eof_now != last_eof {
+        PACE_LAST_EOF.store(eof_now, Ordering::Relaxed);
+        PACE_BYTES.store(req, Ordering::Relaxed);
+        return;
+    }
+
+    let used = PACE_BYTES.load(Ordering::Relaxed);
+    if used.saturating_add(req) <= MAX_CORE0_BYTES_PER_EOF {
+        PACE_BYTES.store(used + req, Ordering::Relaxed);
+        return;
+    }
+
+    // Budget for this EOF window is full; wait for the next EOF refill to finish.
+    while EOF_COUNT.load(Ordering::Acquire) == eof_now || ISR_ACTIVE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    PACE_LAST_EOF.store(EOF_COUNT.load(Ordering::Acquire), Ordering::Relaxed);
+    PACE_BYTES.store(req, Ordering::Relaxed);
+}
+
 #[inline(always)]
 fn read_ccount() -> u32 {
     let cycles: u32;
@@ -297,17 +343,20 @@ fn eof_isr() {
         return;
     }
 
+    ISR_ACTIVE.store(true, Ordering::Release);
+
     let eof_des_addr = dma.ch(0).out_eof_des_addr().read().bits() as usize;
     let descs_base = core::ptr::addr_of!(DESCRIPTORS) as usize;
     let desc_size = core::mem::size_of::<DmaDescriptor>();
     let ring_bytes = N_DESC * desc_size;
 
     if eof_des_addr < descs_base || eof_des_addr >= descs_base + ring_bytes {
-        EOF_COUNT.fetch_add(1, Ordering::Relaxed);
+        EOF_COUNT.fetch_add(1, Ordering::Release);
         dma.ch(0)
             .out_int()
             .clr()
             .write(|w| w.out_eof().clear_bit_by_one());
+        ISR_ACTIVE.store(false, Ordering::Release);
         return;
     }
 
@@ -334,7 +383,7 @@ fn eof_isr() {
         psram_copy_wrapping(psram_base, next_chunk, dest);
     }
 
-    EOF_COUNT.fetch_add(1, Ordering::Relaxed);
+    EOF_COUNT.fetch_add(1, Ordering::Release);
 
     dma.ch(0)
         .out_int()
@@ -346,6 +395,7 @@ fn eof_isr() {
     STAT_FIRES.fetch_add(1, Ordering::Relaxed);
     STAT_CYCLES_SUM.fetch_add(elapsed, Ordering::Relaxed);
     let _ = STAT_CYCLES_MAX.fetch_max(elapsed, Ordering::Relaxed);
+    ISR_ACTIVE.store(false, Ordering::Release);
 }
 
 /// 16-byte-unrolled copy so the ISR never calls Flash-resident `memcpy`

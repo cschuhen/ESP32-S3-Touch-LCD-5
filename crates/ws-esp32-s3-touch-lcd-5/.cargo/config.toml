@@ -13,7 +13,7 @@ rustflags = [
     "-C", "link-arg=-Tlinkall.x",
     "-C", "link-arg=-nostartfiles",
 ]
-runner = "espflash flash --monitor"
+runner = "espflash flash --flash-mode qio --flash-freq 80mhz --monitor"
 
 [unstable]
 build-std = ["alloc", "core"]

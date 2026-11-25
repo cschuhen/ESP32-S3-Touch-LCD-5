@@ -8,6 +8,10 @@
 //! reads PSRAM through that same shared D-Cache, so `flip()`'s Release/Acquire
 //! ordering guarantees visibility without calling `rom_Cache_WriteBack_Addr`
 //! (which would stall/race with Core 1's concurrent PSRAM reads).
+//!
+//! All write methods pace themselves via [`crate::bounce_buffer::pace_psram_write`]
+//! so Core 0 never saturates the shared D-Cache / 40 MHz PSRAM bus while
+//! Core 1 is refilling a bounce half.
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +90,7 @@ impl Framebuffer {
             return;
         }
         let n = (end - range.start).min(pixels.len());
+        crate::bounce_buffer::pace_psram_write(n * 2);
         unsafe {
             let dst = (self.back_ptr() as *mut u16).add(y * WIDTH + range.start);
             for i in 0..n {
@@ -109,6 +114,7 @@ impl Framebuffer {
             return;
         }
         let n = end - x_range.start;
+        crate::bounce_buffer::pace_psram_write(n * 2);
         unsafe {
             let dst = (self.back_ptr() as *mut u16).add(y * WIDTH + x_range.start);
             for i in 0..n {
@@ -128,8 +134,15 @@ impl Framebuffer {
         }
         unsafe {
             let base = self.back_ptr() as *mut u16;
-            for y in y_range.start..end {
-                base.add(y * WIDTH + x).write_volatile(colour);
+            let mut y = y_range.start;
+            while y < end {
+                let chunk_end = (y + 64).min(end);
+                // Each vertical pixel dirties a distinct 32-byte D-cache line.
+                crate::bounce_buffer::pace_psram_write((chunk_end - y) * 32);
+                while y < chunk_end {
+                    base.add(y * WIDTH + x).write_volatile(colour);
+                    y += 1;
+                }
             }
         }
     }
@@ -138,13 +151,21 @@ impl Framebuffer {
         unsafe {
             let lo = (colour & 0xFF) as u8;
             let hi = (colour >> 8) as u8;
-            if lo == hi {
-                core::ptr::write_bytes(base, lo, BYTES);
-            } else {
-                let dst = base as *mut u16;
-                for i in 0..(WIDTH * HEIGHT) {
-                    core::ptr::write(dst.add(i), colour);
+            const CHUNK_BYTES: usize = 2048;
+            let mut offset = 0usize;
+            while offset < BYTES {
+                let len = (BYTES - offset).min(CHUNK_BYTES);
+                crate::bounce_buffer::pace_psram_write(len);
+                if lo == hi {
+                    core::ptr::write_bytes(base.add(offset), lo, len);
+                } else {
+                    let dst = base.add(offset) as *mut u16;
+                    let pixels = len / 2;
+                    for i in 0..pixels {
+                        core::ptr::write(dst.add(i), colour);
+                    }
                 }
+                offset += len;
             }
         }
     }
@@ -206,17 +227,25 @@ mod eg_support {
             I: IntoIterator<Item = Pixel<Self::Color>>,
         {
             let base = self.back_ptr() as *mut u16;
+            let mut pending_px = 0usize;
             for Pixel(coord, color) in pixels {
                 if coord.x >= 0
                     && coord.y >= 0
                     && (coord.x as usize) < WIDTH
                     && (coord.y as usize) < HEIGHT
                 {
+                    if pending_px == 0 {
+                        crate::bounce_buffer::pace_psram_write(32 * 32);
+                    }
                     let x = coord.x as usize;
                     let y = coord.y as usize;
                     let raw = RawU16::from(color).into_inner();
                     unsafe {
                         base.add(y * WIDTH + x).write_volatile(raw);
+                    }
+                    pending_px += 1;
+                    if pending_px >= 32 {
+                        pending_px = 0;
                     }
                 }
             }
