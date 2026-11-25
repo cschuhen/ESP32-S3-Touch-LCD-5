@@ -90,7 +90,6 @@ fn check_psram(fb: &bsp::Framebuffer) -> bool {
                 let pat = ((idx as u32) << 24) ^ (i as u32).wrapping_mul(0x9E37_79B9);
                 ptr.add(i).write_volatile(pat);
             }
-            cache_writeback_and_invalidate(base as u32, bsp::FRAMEBUFFER_BYTES as u32);
             for i in 0..words {
                 let expected = ((idx as u32) << 24) ^ (i as u32).wrapping_mul(0x9E37_79B9);
                 let got = ptr.add(i).read_volatile();
@@ -255,19 +254,6 @@ async fn check_i2c_stress(backlight: &bsp::Backlight, touch: &mut bsp::TouchPoll
     let _ = backlight.on().await;
     log::info!("[PASS] i2c_stress: 50 interleaved backlight+touch ops ok");
     true
-}
-
-unsafe fn cache_writeback_and_invalidate(addr: u32, size: u32) {
-    unsafe {
-        unsafe extern "C" {
-            fn rom_Cache_WriteBack_Addr(addr: u32, size: u32);
-            fn Cache_Suspend_DCache_Autoload() -> u32;
-            fn Cache_Resume_DCache_Autoload(value: u32);
-        }
-        let autoload = Cache_Suspend_DCache_Autoload();
-        rom_Cache_WriteBack_Addr(addr, size);
-        Cache_Resume_DCache_Autoload(autoload);
-    }
 }
 
 fn halt() -> ! {

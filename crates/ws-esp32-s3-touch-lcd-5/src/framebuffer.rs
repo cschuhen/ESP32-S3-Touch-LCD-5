@@ -2,6 +2,12 @@
 //!
 //! For 800×480 RGB565, one framebuffer is 768,000 bytes (two = 1,536,000 bytes)
 //! in 8 MiB Octal PSRAM. For `panel-1024x600`, one framebuffer is 1,228,800 bytes.
+//!
+//! On ESP32-S3, Core 0 and Core 1 share a single L1 D-Cache, and GDMA only
+//! reads DRAM bounce buffers (`accesses_psram: false`). Core 1's `eof_isr`
+//! reads PSRAM through that same shared D-Cache, so `flip()`'s Release/Acquire
+//! ordering guarantees visibility without calling `rom_Cache_WriteBack_Addr`
+//! (which would stall/race with Core 1's concurrent PSRAM reads).
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -70,8 +76,7 @@ impl Framebuffer {
         (self.a, self.b)
     }
 
-    /// Write a span of `range.len()` RGB565 pixels into row `y` of the back buffer
-    /// and flush those cache lines back to physical PSRAM.
+    /// Write a span of `range.len()` RGB565 pixels into row `y` of the back buffer.
     pub fn write_row(&self, y: usize, range: Range<usize>, pixels: &[u16]) {
         if y >= HEIGHT {
             return;
@@ -86,7 +91,6 @@ impl Framebuffer {
             for i in 0..n {
                 dst.add(i).write_volatile(pixels[i]);
             }
-            cache_writeback(dst as u32, (n * core::mem::size_of::<u16>()) as u32);
         }
     }
 
@@ -110,7 +114,6 @@ impl Framebuffer {
             for i in 0..n {
                 dst.add(i).write_volatile(colour);
             }
-            cache_writeback(dst as u32, (n * core::mem::size_of::<u16>()) as u32);
         }
     }
 
@@ -128,9 +131,6 @@ impl Framebuffer {
             for y in y_range.start..end {
                 base.add(y * WIDTH + x).write_volatile(colour);
             }
-            let start_addr = base.add(y_range.start * WIDTH + x) as u32;
-            let end_addr = base.add((end - 1) * WIDTH + x).add(1) as u32;
-            cache_writeback(start_addr, end_addr - start_addr);
         }
     }
 
@@ -146,7 +146,6 @@ impl Framebuffer {
                     core::ptr::write(dst.add(i), colour);
                 }
             }
-            cache_writeback(base as u32, BYTES as u32);
         }
     }
 
@@ -177,28 +176,9 @@ impl Framebuffer {
     }
 }
 
-/// Flush L1 D-cache lines covering `[addr, addr + size)` back to physical PSRAM.
-///
-/// # Safety
-///
-/// `addr` must be in a PSRAM-mapped address range and `size` within bounds.
-#[inline]
-pub(crate) unsafe fn cache_writeback(addr: u32, size: u32) {
-    unsafe {
-        unsafe extern "C" {
-            fn rom_Cache_WriteBack_Addr(addr: u32, size: u32);
-            fn Cache_Suspend_DCache_Autoload() -> u32;
-            fn Cache_Resume_DCache_Autoload(value: u32);
-        }
-        let autoload = Cache_Suspend_DCache_Autoload();
-        rom_Cache_WriteBack_Addr(addr, size);
-        Cache_Resume_DCache_Autoload(autoload);
-    }
-}
-
 #[cfg(feature = "embedded-graphics")]
 mod eg_support {
-    use super::{Framebuffer, HEIGHT, WIDTH, cache_writeback};
+    use super::{Framebuffer, HEIGHT, WIDTH};
     use core::convert::Infallible;
     use embedded_graphics_core::{
         Pixel,
@@ -226,9 +206,6 @@ mod eg_support {
             I: IntoIterator<Item = Pixel<Self::Color>>,
         {
             let base = self.back_ptr() as *mut u16;
-            let mut min_y = HEIGHT;
-            let mut max_y = 0usize;
-
             for Pixel(coord, color) in pixels {
                 if coord.x >= 0
                     && coord.y >= 0
@@ -241,16 +218,6 @@ mod eg_support {
                     unsafe {
                         base.add(y * WIDTH + x).write_volatile(raw);
                     }
-                    min_y = min_y.min(y);
-                    max_y = max_y.max(y + 1);
-                }
-            }
-
-            if min_y < max_y {
-                unsafe {
-                    let start = base.add(min_y * WIDTH) as u32;
-                    let size = ((max_y - min_y) * WIDTH * core::mem::size_of::<u16>()) as u32;
-                    cache_writeback(start, size);
                 }
             }
             Ok(())
