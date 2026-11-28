@@ -1,5 +1,15 @@
-/target
+target/
 **/*.rs.bk
-.DS_Store
 Cargo.lock
+
+# Local scratch notes
+/prompt.txt
+
+# Editor & OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
 .claude/
