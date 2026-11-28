@@ -74,9 +74,9 @@ static ISR_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PACE_LAST_EOF: AtomicU32 = AtomicU32::new(0);
 static PACE_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// Max Core 0 PSRAM write budget per EOF interval (~128 dirty 32-byte cache lines),
+/// Max Core 0 PSRAM write budget per EOF interval (~24 dirty 64-byte cache lines),
 /// keeping Core 1's shared-cache refill comfortably below the 1,093 us deadline.
-const MAX_CORE0_BYTES_PER_EOF: u32 = 4096;
+const MAX_CORE0_BYTES_PER_EOF: u32 = 1536;
 
 /// ISR execution telemetry snapshot returned by [`BounceRing::take_isr_stats`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -137,6 +137,41 @@ impl BounceRing {
                     (*d).next = descs_base.add(next_global);
                 }
             }
+
+            // Enable ESP32-S3 hardware D-Cache sequential autoload across the double PSRAM
+            // framebuffer so Core 1's sequential bounce copies prefetch ahead in hardware.
+            let extmem = &*esp_hal::peripherals::EXTMEM::PTR;
+            extmem
+                .dcache_autoload_ctrl()
+                .modify(|_, w| w.dcache_autoload_ena().clear_bit());
+            while !extmem
+                .dcache_autoload_ctrl()
+                .read()
+                .dcache_autoload_done()
+                .bit_is_set()
+            {
+                core::hint::spin_loop();
+            }
+            extmem
+                .dcache_autoload_sct0_addr()
+                .write(|w| w.dcache_autoload_sct0_addr().bits(psram_fb_ptr as u32));
+            extmem
+                .dcache_autoload_sct0_size()
+                .write(|w| w.dcache_autoload_sct0_size().bits(framebuffer::PSRAM_BYTES_REQUIRED as u32));
+            extmem.dcache_autoload_ctrl().modify(|_, w| {
+                w.dcache_autoload_sct0_ena()
+                    .set_bit()
+                    .dcache_autoload_sct1_ena()
+                    .clear_bit()
+                    .dcache_autoload_order()
+                    .clear_bit()
+                    .dcache_autoload_rqst()
+                    .bits(2)
+                    .dcache_autoload_size()
+                    .bits(3)
+                    .dcache_autoload_ena()
+                    .set_bit()
+            });
 
             let init_a_chunk = STARTUP_OFFSET_HALVES % HALVES_PER_FRAME;
             let init_b_chunk = (STARTUP_OFFSET_HALVES + 1) % HALVES_PER_FRAME;
@@ -210,6 +245,35 @@ unsafe impl DmaTxBuffer for BounceRing {
     fn from_view(view: Self::View) -> Self {
         view
     }
+}
+
+/// Reconfigure ESP32-S3 L1 D-Cache from 32-byte to 64-byte lines (keeping
+/// 32 KiB / 8-way so internal DRAM is unchanged) to halve Octal PSRAM burst
+/// overhead during Core 1 bounce-buffer refills.
+///
+/// # Safety
+///
+/// Must be called on Core 0 before Core 1 starts and before PSRAM framebuffer use.
+#[esp_hal::ram]
+pub(crate) unsafe fn enable_64byte_dcache_lines() {
+    unsafe extern "C" {
+        fn Cache_WriteBack_All();
+        fn Cache_Suspend_DCache() -> u32;
+        fn rom_config_data_cache_mode(
+            cfg_cache_size: u32,
+            cfg_cache_ways: u8,
+            cfg_cache_line_size: u8,
+        );
+        fn Cache_Invalidate_DCache_All();
+        fn Cache_Resume_DCache(param: u32);
+    }
+    critical_section::with(|_| unsafe {
+        Cache_WriteBack_All();
+        let autoload = Cache_Suspend_DCache();
+        rom_config_data_cache_mode(0x8000, 8, 64);
+        Cache_Invalidate_DCache_All();
+        Cache_Resume_DCache(autoload);
+    });
 }
 
 /// Queue a tear-free front-buffer swap for the next frame boundary.
@@ -300,8 +364,18 @@ pub(crate) fn pace_psram_write(bytes: usize) {
     let eof_now = EOF_COUNT.load(Ordering::Acquire);
     let last_eof = PACE_LAST_EOF.load(Ordering::Relaxed);
 
-    if eof_now != last_eof {
+    if eof_now.wrapping_sub(last_eof) == 1 {
         PACE_LAST_EOF.store(eof_now, Ordering::Relaxed);
+        PACE_BYTES.store(req, Ordering::Relaxed);
+        return;
+    }
+
+    if eof_now != last_eof {
+        // Fresh write burst after idle: align to the start of the quiet window right after eof_isr.
+        while EOF_COUNT.load(Ordering::Acquire) == eof_now || ISR_ACTIVE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        PACE_LAST_EOF.store(EOF_COUNT.load(Ordering::Acquire), Ordering::Relaxed);
         PACE_BYTES.store(req, Ordering::Relaxed);
         return;
     }

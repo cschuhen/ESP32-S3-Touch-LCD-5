@@ -137,8 +137,8 @@ impl Framebuffer {
             let mut y = y_range.start;
             while y < end {
                 let chunk_end = (y + 64).min(end);
-                // Each vertical pixel dirties a distinct 32-byte D-cache line.
-                crate::bounce_buffer::pace_psram_write((chunk_end - y) * 32);
+                // Each vertical pixel dirties a distinct 64-byte D-cache line.
+                crate::bounce_buffer::pace_psram_write((chunk_end - y) * 64);
                 while y < chunk_end {
                     base.add(y * WIDTH + x).write_volatile(colour);
                     y += 1;
@@ -227,25 +227,31 @@ mod eg_support {
             I: IntoIterator<Item = Pixel<Self::Color>>,
         {
             let base = self.back_ptr() as *mut u16;
-            let mut pending_px = 0usize;
+            let mut last_line = usize::MAX;
+            let mut dirty_lines = 0usize;
             for Pixel(coord, color) in pixels {
                 if coord.x >= 0
                     && coord.y >= 0
                     && (coord.x as usize) < WIDTH
                     && (coord.y as usize) < HEIGHT
                 {
-                    if pending_px == 0 {
-                        crate::bounce_buffer::pace_psram_write(32 * 32);
-                    }
                     let x = coord.x as usize;
                     let y = coord.y as usize;
+                    let dst = unsafe { base.add(y * WIDTH + x) };
+                    let line = (dst as usize) >> 6;
+                    if line != last_line {
+                        last_line = line;
+                        if dirty_lines == 0 {
+                            crate::bounce_buffer::pace_psram_write(8 * 64);
+                        }
+                        dirty_lines += 1;
+                        if dirty_lines >= 8 {
+                            dirty_lines = 0;
+                        }
+                    }
                     let raw = RawU16::from(color).into_inner();
                     unsafe {
-                        base.add(y * WIDTH + x).write_volatile(raw);
-                    }
-                    pending_px += 1;
-                    if pending_px >= 32 {
-                        pending_px = 0;
+                        dst.write_volatile(raw);
                     }
                 }
             }

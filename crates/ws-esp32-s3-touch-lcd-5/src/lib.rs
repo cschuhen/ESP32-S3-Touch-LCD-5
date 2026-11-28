@@ -241,6 +241,7 @@ pub fn init(r: Resources<'static>) -> Result<Board, Error> {
 
     // ----- PSRAM framebuffer + DRAM bounce-buffer ring ---------------------
     let (psram_ptr, psram_size) = esp_hal::psram::psram_raw_parts(&r.psram);
+    unsafe { bounce_buffer::enable_64byte_dcache_lines(); }
     let (initial_front_ptr, framebuffer) =
         unsafe { framebuffer::Framebuffer::split_from_psram(psram_ptr, psram_size) }
             .ok_or(Error::PsramTooSmall)?;
