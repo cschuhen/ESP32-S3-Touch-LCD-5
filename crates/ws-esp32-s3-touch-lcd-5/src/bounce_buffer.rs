@@ -74,9 +74,9 @@ static ISR_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PACE_LAST_EOF: AtomicU32 = AtomicU32::new(0);
 static PACE_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// Max Core 0 PSRAM write budget per EOF interval (~24 dirty 64-byte cache lines),
+/// Max Core 0 PSRAM write budget per EOF interval (~64 dirty 64-byte cache lines),
 /// keeping Core 1's shared-cache refill comfortably below the 1,093 us deadline.
-const MAX_CORE0_BYTES_PER_EOF: u32 = 1536;
+const MAX_CORE0_BYTES_PER_EOF: u32 = 4096;
 
 /// ISR execution telemetry snapshot returned by [`BounceRing::take_isr_stats`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -364,7 +364,7 @@ pub(crate) fn pace_psram_write(bytes: usize) {
     let eof_now = EOF_COUNT.load(Ordering::Acquire);
     let last_eof = PACE_LAST_EOF.load(Ordering::Relaxed);
 
-    if eof_now.wrapping_sub(last_eof) == 1 {
+    if eof_now.wrapping_sub(last_eof) <= 4 {
         PACE_LAST_EOF.store(eof_now, Ordering::Relaxed);
         PACE_BYTES.store(req, Ordering::Relaxed);
         return;

@@ -116,9 +116,21 @@ impl Framebuffer {
         let n = end - x_range.start;
         crate::bounce_buffer::pace_psram_write(n * 2);
         unsafe {
-            let dst = (self.back_ptr() as *mut u16).add(y * WIDTH + x_range.start);
-            for i in 0..n {
-                dst.add(i).write_volatile(colour);
+            let mut dst = (self.back_ptr() as *mut u16).add(y * WIDTH + x_range.start);
+            let mut rem = n;
+            if rem > 0 && (dst as usize) & 2 != 0 {
+                dst.write_volatile(colour);
+                dst = dst.add(1);
+                rem -= 1;
+            }
+            let pair = (colour as u32) | ((colour as u32) << 16);
+            let dst32 = dst as *mut u32;
+            let pairs = rem / 2;
+            for i in 0..pairs {
+                dst32.add(i).write_volatile(pair);
+            }
+            if rem & 1 != 0 {
+                dst.add(rem - 1).write_volatile(colour);
             }
         }
     }
@@ -151,7 +163,8 @@ impl Framebuffer {
         unsafe {
             let lo = (colour & 0xFF) as u8;
             let hi = (colour >> 8) as u8;
-            const CHUNK_BYTES: usize = 2048;
+            let pair = (colour as u32) | ((colour as u32) << 16);
+            const CHUNK_BYTES: usize = 4096;
             let mut offset = 0usize;
             while offset < BYTES {
                 let len = (BYTES - offset).min(CHUNK_BYTES);
@@ -159,10 +172,13 @@ impl Framebuffer {
                 if lo == hi {
                     core::ptr::write_bytes(base.add(offset), lo, len);
                 } else {
-                    let dst = base.add(offset) as *mut u16;
-                    let pixels = len / 2;
-                    for i in 0..pixels {
-                        core::ptr::write(dst.add(i), colour);
+                    let dst = base.add(offset) as *mut u32;
+                    let words = len / 4;
+                    for i in 0..words {
+                        core::ptr::write(dst.add(i), pair);
+                    }
+                    if len & 2 != 0 {
+                        core::ptr::write(base.add(offset + len - 2) as *mut u16, colour);
                     }
                 }
                 offset += len;
@@ -259,11 +275,16 @@ mod eg_support {
         }
 
         fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-            let clipped = area.intersection(&self.bounding_box());
+            let bounds = self.bounding_box();
+            let clipped = area.intersection(&bounds);
             if clipped.is_zero_sized() {
                 return Ok(());
             }
             let raw = RawU16::from(color).into_inner();
+            if clipped == bounds {
+                self.fill(raw);
+                return Ok(());
+            }
             let x0 = clipped.top_left.x as usize;
             let x1 = x0 + clipped.size.width as usize;
             let y0 = clipped.top_left.y as usize;
